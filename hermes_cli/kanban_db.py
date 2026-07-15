@@ -2097,6 +2097,31 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             (new, old),
         )
 
+    # Additive billing-attribution columns on task_runs.
+    # These let us prove which provider/model billed each Kanban run
+    # without relying on session inference. All nullable — old code
+    # continues to work if they're empty.
+    if runs_exist:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        if "billing_session_id" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "billing_session_id", "billing_session_id TEXT"
+            )
+        if "billing_provider" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "billing_provider", "billing_provider TEXT"
+            )
+        if "billing_base_url" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "billing_base_url", "billing_base_url TEXT"
+            )
+        if "billing_model" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "billing_model", "billing_model TEXT"
+            )
+
     _rebuild_drifted_tables(conn)
 
 
@@ -3268,6 +3293,12 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+
+    # Best-effort billing attribution: write the worker's session/provider
+    # info to the run row so we can prove direct-vs-Nous billing. Failures
+    # here must never block task completion — telemetry is best-effort.
+    _try_record_run_billing(conn, run_id)
+
     conn.execute(
         """
         UPDATE task_runs
@@ -3297,6 +3328,38 @@ def _end_run(
         "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
     )
     return run_id
+
+
+def _try_record_run_billing(conn: sqlite3.Connection, run_id: int) -> None:
+    """Best-effort: write billing session/provider info to a task_run.
+
+    Reads HERMES_SESSION_ID and billing env vars from the worker's
+    environment. Never raises — telemetry failure must not block task
+    completion.
+    """
+    try:
+        session_id = os.environ.get("HERMES_SESSION_ID")
+        if not session_id:
+            return
+
+        billing_provider = os.environ.get("HERMES_BILLING_PROVIDER")
+        billing_base_url = os.environ.get("HERMES_BILLING_BASE_URL")
+        billing_model = os.environ.get("HERMES_MODEL")
+
+        # Only write if we have at least a session_id
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET billing_session_id = COALESCE(?, billing_session_id),
+                   billing_provider   = COALESCE(?, billing_provider),
+                   billing_base_url   = COALESCE(?, billing_base_url),
+                   billing_model      = COALESCE(?, billing_model)
+             WHERE id = ?
+            """,
+            (session_id, billing_provider, billing_base_url, billing_model, run_id),
+        )
+    except Exception:
+        pass
 
 
 def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
