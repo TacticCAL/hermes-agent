@@ -2383,6 +2383,111 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+# ---------------------------------------------------------------------------
+# One Follow-Up Rule enforcement
+# ---------------------------------------------------------------------------
+
+# Role → allowed follow-up kinds
+_ROLE_FOLLOW_UP_RULES = {
+    "builder": {"review"},
+    "fixer": {"review"},
+    "verifier": {"deploy"},
+    "reviewer": {"deploy"},
+    "tdc": {"deploy"},
+    "deployer": set(),  # Deployers create zero follow-up tasks
+    "planner": set(),   # Planners create zero automatic children
+}
+
+# Profiles that map to each role (checked by prefix/contains)
+_PROFILE_ROLE_MAP = {
+    "builder": "builder",
+    "fix": "fixer",
+    "fixer": "fixer",
+    "verifier": "verifier",
+    "reviewer": "reviewer",
+    "tdc": "tdc",
+    "deployer": "deployer",
+    "deploy": "deployer",
+    "planner": "planner",
+    "plan": "planner",
+    "notc": "builder",  # Module builders are builder-role for follow-ups
+    "4473": "builder",
+    "cflc": "builder",
+    "td-sec": "fixer",
+    "td-platform": "builder",
+    "td-slop": "fixer",
+    "video": "builder",
+    "tacticcal-website": "builder",
+    "scheduler": "deployer",  # Scheduler module should not create tasks
+    "default": "builder",  # Default assignee treated as builder
+}
+
+
+def _profile_role(profile_name: str) -> str:
+    """Map a profile name to a role for follow-up enforcement."""
+    if not profile_name:
+        return "builder"
+    name = profile_name.lower()
+    for prefix, role in _PROFILE_ROLE_MAP.items():
+        if name.startswith(prefix) or prefix in name:
+            return role
+    return "builder"
+
+
+def _enforce_follow_up_rule(
+    conn: sqlite3.Connection,
+    *,
+    follow_up_kind: str,
+    assignee: Optional[str] = None,
+    created_by: Optional[str] = None,
+) -> None:
+    """Enforce the One Follow-Up Rule at the kernel level.
+
+    Rules:
+    - Builder/Fixer → may create at most one 'review' follow-up
+    - Verifier/Reviewer/TDC → may create at most one 'deploy' follow-up
+    - Deployer → zero follow-up tasks
+    - Planner → zero automatic children (Mike must approve explicitly)
+    - Any role → zero 'fix' or 'rework' children (failed reviews
+      comment/reassign, they don't create new cards)
+
+    The count is per-origin-task (HERMES_KANBAN_TASK), not global.
+    """
+    origin_task = os.environ.get("HERMES_KANBAN_TASK")
+    origin_profile = created_by or os.environ.get("HERMES_PROFILE") or ""
+
+    if not origin_task:
+        # Not a dispatcher-spawned worker (Mike/dashboard/CLI creating
+        # a task directly). No follow-up rule applies — this is the
+        # legitimate top-level creation path.
+        return
+
+    role = _profile_role(origin_profile)
+
+    # Check that this role is allowed to create this follow-up kind
+    allowed_kinds = _ROLE_FOLLOW_UP_RULES.get(role, set())
+    if follow_up_kind not in allowed_kinds:
+        raise ValueError(
+            f"This task already used its one follow-up. "
+            f"Role '{role}' (profile '{origin_profile}') cannot create "
+            f"a '{follow_up_kind}' task. Comment on the existing task instead."
+        )
+
+    # Check that the origin task hasn't already used its one follow-up
+    # Count existing children created by this origin task
+    existing_children = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_links WHERE parent_id = ?",
+        (origin_task,),
+    ).fetchone()["n"]
+
+    if existing_children > 0:
+        raise ValueError(
+            f"This task already used its one follow-up. "
+            f"Comment on the existing task instead. "
+            f"(Origin task {origin_task} already has {existing_children} child)"
+        )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2407,6 +2512,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    follow_up_kind: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2434,6 +2540,21 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+
+    # ------------------------------------------------------------------
+    # One Follow-Up Rule enforcement
+    # ------------------------------------------------------------------
+    # When a dispatcher-spawned worker (HERMES_KANBAN_TASK set) creates
+    # a child task, enforce the bounded chain: Fix → Review → Deploy.
+    # This is a code-level guard — the SOUL.md rule is prompt-only and
+    # can be ignored by the model. This kernel guard cannot be bypassed.
+    if follow_up_kind:
+        _enforce_follow_up_rule(
+            conn,
+            follow_up_kind=follow_up_kind,
+            assignee=assignee,
+            created_by=created_by,
+        )
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
