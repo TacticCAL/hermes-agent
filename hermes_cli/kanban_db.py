@@ -5641,6 +5641,90 @@ DEFAULT_FAILURE_LIMIT = 2
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 
+
+# ---------------------------------------------------------------------------
+# Deterministic failure classification
+# ---------------------------------------------------------------------------
+
+def classify_failure(error_text: str) -> str:
+    """Classify a failure error string into a failure category.
+
+    Categories:
+    - "non_retryable_config": auth/credential/model-not-found/profile-missing.
+      These cannot heal without human or config action. Block after 1 attempt.
+    - "rate_limit": 429 / quota exceeded. Defer, don't count as failure.
+    - "transient": network/timeout. Normal retry (limit 3).
+    - "task": build/test failures. Normal retry (limit 3).
+    - "protocol": clean exit without transition. Deterministic, block after 1.
+
+    Never logs secrets — only checks safe/redacted patterns.
+    """
+    if not error_text:
+        return "task"
+
+    text = str(error_text).lower()
+
+    # Non-retryable: auth/credential/config errors that cannot heal on retry
+    non_retryable_patterns = [
+        "401", "unauthorized", "invalid api key", "invalid_api_key",
+        "api key not set", "api_key not set", "missing credential",
+        "missing api key", "authentication failed",
+        "403", "forbidden", "permission denied", "access denied",
+        "404", "model not found", "model_not_found",
+        "model 'glm-5.2' not found", "model 'grok-4.5' not found",
+        "does not exist", "profile not found",
+        "executable not found", "hermes executable",
+        "no module named", "importerror",
+    ]
+    for pattern in non_retryable_patterns:
+        if pattern in text:
+            return "non_retryable_config"
+
+    # Rate limit: defer, don't block
+    rate_limit_patterns = [
+        "429", "rate limit", "rate_limit", "quota exceeded",
+        "quota_exceeded", "too many requests", "retry after",
+    ]
+    for pattern in rate_limit_patterns:
+        if pattern in text:
+            return "rate_limit"
+
+    # Transient: network/timeout
+    transient_patterns = [
+        "timeout", "timed out", "connection reset", "econnreset",
+        "network unreachable", "connection refused", "connection aborted",
+        "broken pipe", "ssl: certificate", "temporarily unavailable",
+    ]
+    for pattern in transient_patterns:
+        if pattern in text:
+            return "transient"
+
+    # Default: ordinary task/build/test failure
+    return "task"
+
+
+def effective_failure_limit(error_text: str, base_limit: int = 3) -> Optional[int]:
+    """Return the effective failure limit for an error.
+
+    - non_retryable_config → 1 (block immediately)
+    - rate_limit → None (defer, don't count as failure)
+    - transient → base_limit (normal retry)
+    - task → base_limit (normal retry)
+    - protocol → 1 (clean exit without transition is deterministic)
+
+    Returns None for rate_limit (defer without counting).
+    """
+    category = classify_failure(error_text)
+
+    if category == "non_retryable_config":
+        return 1
+    if category == "rate_limit":
+        return None  # Defer — don't block, don't count
+    if category == "protocol":
+        return 1
+    # transient and task use the base limit
+    return base_limit
+
 # Max bytes to keep in a single worker log file. The dispatcher truncates
 # and rotates on spawn if the file is larger than this at spawn time.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
