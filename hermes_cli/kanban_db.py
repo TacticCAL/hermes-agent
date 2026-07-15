@@ -5718,6 +5718,13 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_disabled_profile: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks skipped because their assignee profile has
+    ``kanban.enabled: false`` in its config. Each entry is
+    ``(task_id, profile_name)``. Prevents disabled scanners
+    (td-anti-slop, td-slop-fix) from being auto-spawned even when a
+    Ready task is assigned to them. NOT a failure — does not increment
+    the task's consecutive_failures counter."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -6872,6 +6879,103 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     return None
 
 
+# ---------------------------------------------------------------------------
+# Profile dispatch eligibility
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ProfileDispatchEligibility:
+    """Result of checking whether a profile can receive Kanban dispatch.
+
+    ``exists`` is False for missing profiles. ``enabled`` is False when the
+    profile config explicitly sets ``kanban.enabled: false``. ``reason`` is a
+    short human-readable diagnostic (never None when enabled=False).
+    """
+    exists: bool
+    enabled: bool
+    reason: Optional[str] = None
+
+
+def _check_profile_dispatch_eligibility(
+    profile_name: str,
+    *,
+    hermes_home: Optional[str] = None,
+) -> ProfileDispatchEligibility:
+    """Check whether a profile is eligible for Kanban auto-dispatch.
+
+    Rules:
+    - Missing profile → nonspawnable (exists=False, enabled=False)
+    - Config absent ``kanban`` key → enabled (backward compatible)
+    - Explicit ``kanban.enabled: false`` → disabled
+    - Explicit ``kanban.enabled: true`` or omitted → enabled
+    - Invalid/unreadable config → fail closed (enabled=False)
+
+    When ``hermes_home`` is provided, profile resolution uses that path
+    instead of the default HERMES_HOME (used by tests).
+    """
+    import yaml as _yaml
+
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+    except Exception:
+        return ProfileDispatchEligibility(
+            exists=False, enabled=False, reason="profiles module unavailable"
+        )
+
+    canon = normalize_profile_name(profile_name)
+    if canon == "default":
+        return ProfileDispatchEligibility(exists=True, enabled=True)
+
+    # Resolve profile directory — use hermes_home override if provided
+    if hermes_home:
+        profile_dir = Path(hermes_home) / "profiles" / canon
+    else:
+        try:
+            from hermes_cli.profiles import get_profile_dir
+            profile_dir = get_profile_dir(canon)
+        except Exception:
+            return ProfileDispatchEligibility(
+                exists=False, enabled=False,
+                reason=f"Could not resolve profile dir for '{canon}'",
+            )
+
+    if not profile_dir.is_dir():
+        return ProfileDispatchEligibility(
+            exists=False, enabled=False,
+            reason=f"Profile '{canon}' does not exist",
+        )
+
+    # Read the profile's config.yaml to check kanban.enabled
+    cfg_path = profile_dir / "config.yaml"
+    if not cfg_path.is_file():
+        # Profile dir exists but no config.yaml — treat as enabled (backward compat)
+        return ProfileDispatchEligibility(exists=True, enabled=True)
+
+    try:
+        raw = cfg_path.read_text(encoding="utf-8")
+        cfg = _yaml.safe_load(raw) or {}
+    except Exception as exc:
+        return ProfileDispatchEligibility(
+            exists=True, enabled=False,
+            reason=f"Profile '{canon}' config unreadable: {exc}",
+        )
+
+    kanban_cfg = cfg.get("kanban")
+    if kanban_cfg is None:
+        # No kanban key → backward compatible → enabled
+        return ProfileDispatchEligibility(exists=True, enabled=True)
+
+    if isinstance(kanban_cfg, dict):
+        enabled_val = kanban_cfg.get("enabled", True)
+        if enabled_val is False:
+            return ProfileDispatchEligibility(
+                exists=True, enabled=False,
+                reason=f"Profile '{canon}' is disabled (kanban.enabled: false)",
+            )
+
+    return ProfileDispatchEligibility(exists=True, enabled=True)
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -7207,6 +7311,18 @@ def _dispatch_once_locked(
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
             continue
+        # Check kanban.enabled: profiles explicitly disabled (e.g.
+        # td-anti-slop, td-slop-fix) must never be auto-spawned even
+        # if a Ready task is assigned to them. This is NOT a failure —
+        # do not increment consecutive_failures.
+        eligibility = _check_profile_dispatch_eligibility(row_assignee)
+        if not eligibility.enabled:
+            result.skipped_disabled_profile.append((row["id"], row_assignee))
+            _log.info(
+                "kanban dispatch: task %s skipped — %s",
+                row["id"], eligibility.reason,
+            )
+            continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
@@ -7340,6 +7456,15 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        # Check kanban.enabled for review tasks too
+        review_eligibility = _check_profile_dispatch_eligibility(row["assignee"])
+        if not review_eligibility.enabled:
+            result.skipped_disabled_profile.append((row["id"], row["assignee"]))
+            _log.info(
+                "kanban dispatch (review): task %s skipped — %s",
+                row["id"], review_eligibility.reason,
+            )
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
