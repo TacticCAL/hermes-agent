@@ -3511,12 +3511,28 @@ def recompute_ready(
                 # this predicate back).
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.status, t.block_kind FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            # A parent that is done/archived satisfies the dependency.
+            # A parent that is *blocked for review* (worker called
+            # kanban_block(reason="review-required: ...")) also satisfies
+            # the dependency — the review task should be promoted to ready
+            # so the verifier can pick it up immediately, rather than
+            # waiting in todo forever because the parent never reaches 'done'.
+            def _parent_satisfied(p):
+                if p["status"] in ("done", "archived"):
+                    return True
+                if p["status"] == "blocked" and p["block_kind"] is None:
+                    # Sticky block without a known kind — treat as
+                    # review-required (the common case when a builder
+                    # blocks itself for review).  This lets the review
+                    # child promote so the verifier can run it.
+                    return True
+                return False
+            if all(_parent_satisfied(p) for p in parents):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -5873,11 +5889,13 @@ def classify_failure(error_text: str) -> str:
         if pattern in text:
             return "rate_limit"
 
-    # Transient: network/timeout
+    # Transient: network/timeout/RAM-crash
     transient_patterns = [
         "timeout", "timed out", "connection reset", "econnreset",
         "network unreachable", "connection refused", "connection aborted",
         "broken pipe", "ssl: certificate", "temporarily unavailable",
+        "not alive", "pid ", "not enough memory", "winerror 8",
+        "out of memory", "memoryerror", "oserror 1455",
     ]
     for pattern in transient_patterns:
         if pattern in text:

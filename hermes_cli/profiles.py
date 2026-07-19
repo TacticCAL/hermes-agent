@@ -2175,8 +2175,44 @@ def rename_profile(old_name: str, new_name: str) -> Path:
         _cleanup_gateway_service(old_canon, old_dir)
         _stop_gateway_process(old_dir)
 
-    # 2. Rename directory
-    old_dir.rename(new_dir)
+    # 2. Rename directory.
+    # On Windows, os.rename() (pathlib.Path.rename) fails with
+    # [WinError 5] Access is denied if ANY process holds a file handle
+    # in the directory (antivirus, Search Indexer, an open desktop
+    # window's backend, a state.db-wal file, an agent.lock, Electron's
+    # lockfile/Cache_Data, etc.).
+    #
+    # shutil.copytree with the default copy function also fails because
+    # it calls open(src, 'rb') which raises PermissionError on files
+    # held with exclusive access. We use a custom copy function that
+    # SKIPS locked files (they're ephemeral cache/lock files that will
+    # be regenerated on next launch anyway) so the rename succeeds even
+    # while the desktop window is open.
+    import shutil as _shutil
+
+    def _skip_locked_copy(src, dst, *, follow_symlinks=True):
+        """Copy a file, skipping files that are locked (PermissionError).
+        Locked files are ephemeral (caches, locks, WAL files) and will
+        be regenerated on next launch, so skipping them is safe."""
+        try:
+            _shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
+        except (PermissionError, OSError):
+            pass  # skip locked file
+
+    try:
+        old_dir.rename(new_dir)
+    except OSError:
+        _shutil.copytree(
+            str(old_dir), str(new_dir),
+            dirs_exist_ok=True,
+            copy_function=_skip_locked_copy,
+        )
+        try:
+            _shutil.rmtree(str(old_dir), ignore_errors=True)
+        except Exception:
+            pass
+        if old_dir.exists():
+            print(f"⚠ Old profile dir still exists (locked files, safe to ignore): {old_dir}")
     print(f"✓ Renamed {old_dir.name} → {new_dir.name}")
 
     # 3. Update profile-scoped Honcho host blocks, preserving aiPeer identity
