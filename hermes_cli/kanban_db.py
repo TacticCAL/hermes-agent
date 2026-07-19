@@ -914,6 +914,9 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Deploy lane tag (Phase 0). See the column comment in SCHEMA_SQL.
+    # NULL = derive the owning deployer from the board at dispatch time.
+    deploy_lane: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -997,6 +1000,9 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            deploy_lane=(
+                row["deploy_lane"] if "deploy_lane" in keys and row["deploy_lane"] else None
             ),
         )
 
@@ -1175,7 +1181,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Deploy lane tag (Phase 0). Identifies which deployer lane owns
+    -- this task's deploy step. NULL = derive from the task's board at
+    -- dispatch time via DEPLOY_LANE_ROUTES. Set explicitly to override
+    -- the board-derived lane (rare; used when a deploy task must run on
+    -- a different board's deployer than its own).
+    deploy_lane          TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1986,6 +1998,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "deploy_lane" not in cols:
+        # Phase 0 deploy lanes: optional per-task lane tag. NULL = derive
+        # the owning deployer from the task's board at dispatch time via
+        # DEPLOY_LANE_ROUTES. Existing rows get NULL (derive-from-board),
+        # preserving the behaviour they had before the column existed.
+        _add_column_if_missing(conn, "tasks", "deploy_lane", "deploy_lane TEXT")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2459,6 +2478,170 @@ def _profile_role(profile_name: str) -> str:
     return "builder"
 
 
+# ---------------------------------------------------------------------------
+# Phase 0 — Deploy Lanes
+# ---------------------------------------------------------------------------
+# Routing table: board slug -> deployer profile that owns deploy tasks on
+# that board. Kills the "wrong-deployer" problem: a deploy task created on
+# the sitrep-ready board can never be run by the main `deployer` (or vice
+# versa) because the dispatcher consults this table before spawning.
+#
+# Convention: a board slug ``X`` routes to ``deployer-X`` when that profile
+# exists, otherwise to the main ``deployer``. Explicit ``deployer-<slug>``
+# overrides below pin boards whose deployer profile name does not follow the
+# plain slug convention (e.g. ``sitrep-core`` -> ``deployer-sitrepcore``).
+# Anything not listed falls through to the derive-from-slug rule, then to
+# the main ``deployer`` — so new boards work without editing this table.
+DEFAULT_DEPLOYER = "deployer"
+
+DEPLOY_LANE_ROUTES: dict[str, str] = {
+    "sitrep-core": "deployer-sitrepcore",
+    "sitrepcore": "deployer-sitrepcore",
+    "appraisal-firearm": "deployer-appraisal-firearm",
+    "probate-firearm": "deployer-probate-firearm",
+    "sitrep-ready": "deployer-sitrep-ready",
+}
+
+
+def resolve_deployer_for_board(board: Optional[str]) -> str:
+    """Return the deployer profile that owns deploy tasks on ``board``.
+
+    Resolution order:
+      1. Explicit ``DEPLOY_LANE_ROUTES`` entry for the board slug.
+      2. ``deployer-<slug>`` if the board slug is non-empty (caller is
+         responsible for profile-existence checks; this function is pure
+         string logic so it stays testable without a profile store).
+      3. ``DEFAULT_DEPLOYER`` (the main ``deployer``) as the catch-all.
+
+    Never raises. Never returns None. The fallback is always the main
+    deployer so a misconfigured or new board never silently breaks deploys.
+    """
+    if not board:
+        return DEFAULT_DEPLOYER
+    slug = str(board).strip().lower()
+    if not slug:
+        return DEFAULT_DEPLOYER
+    if slug in DEPLOY_LANE_ROUTES:
+        return DEPLOY_LANE_ROUTES[slug]
+    return f"deployer-{slug}"
+
+
+def resolve_deployer_for_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> str:
+    """Return the deployer that should run a deploy task.
+
+    Honours an explicit ``deploy_lane`` tag on the task row when set;
+    otherwise derives from the board via ``resolve_deployer_for_board``.
+    """
+    row = conn.execute(
+        "SELECT deploy_lane FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    explicit = row["deploy_lane"] if row and row["deploy_lane"] else None
+    if explicit:
+        slug = explicit.strip().lower()
+        if slug in DEPLOY_LANE_ROUTES:
+            return DEPLOY_LANE_ROUTES[slug]
+        return f"deployer-{slug}" if slug else DEFAULT_DEPLOYER
+    return resolve_deployer_for_board(board)
+
+
+def _is_deploy_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Heuristic: does this task's assignee name a deployer?
+
+    Used by the dispatch guard so the lane check only fires on deploy
+    tasks (not builder/verifier tasks, which are free to run on any
+    profile the assignee names).
+    """
+    row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row or not row["assignee"]:
+        return False
+    return _profile_role(row["assignee"]) == "deployer"
+
+
+def _enforce_deploy_lane(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str],
+    dry_run: bool = False,
+) -> Optional[str]:
+    """Dispatch guard for deploy tasks.
+
+    If the task is a deploy task (assignee role == deployer) and its
+    assignee does NOT match the lane-resolved deployer for this board,
+    rewrite the assignee to the correct deployer and emit a
+    ``deploy_lane_rerouted`` event. Returns the (possibly corrected)
+    assignee that the dispatcher should spawn.
+
+    Non-deploy tasks are returned unchanged (their assignee is left
+    alone). Returns None when the task row is missing.
+
+    Profile-existence safety: when the lane-resolved deployer does not
+    exist on disk (e.g. a board with no ``deployer-<slug>`` profile,
+    like ``tacticcal`` or ``module-2``), the guard falls back to
+    ``DEFAULT_DEPLOYER`` rather than rerouting to a phantom profile
+    that the downstream profile_exists check would reject as
+    nonspawnable. This keeps boards without a dedicated deployer
+    working on the main ``deployer`` exactly as they did before
+    Phase 0.
+    """
+    row = conn.execute(
+        "SELECT assignee, deploy_lane FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row:
+        return None
+    current = row["assignee"]
+    if not current or _profile_role(current) != "deployer":
+        return current
+    correct = resolve_deployer_for_task(
+        conn, task_id, board=board,
+    )
+    # Safety: never reroute to a deployer profile that doesn't exist on
+    # disk. Boards without a dedicated deployer-<slug> profile stay on
+    # whichever deployer they already have (typically the main
+    # ``deployer``), preserving pre-Phase-0 behaviour.
+    if correct != DEFAULT_DEPLOYER:
+        try:
+            from hermes_cli.profiles import profile_exists as _pe
+            if not _pe(correct):
+                correct = DEFAULT_DEPLOYER
+        except Exception:
+            # Profiles module not importable (test stubs). Trust the
+            # routing table — tests stub profile_exists at the
+            # dispatcher level, not here.
+            pass
+    if correct == current:
+        return current
+    # Reroute: the wrong deployer was written on this deploy task.
+    if not dry_run:
+        try:
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET assignee = ? WHERE id = ?",
+                    (correct, task_id),
+                )
+                _append_event(
+                    conn, task_id, "deploy_lane_rerouted",
+                    {
+                        "from": current,
+                        "to": correct,
+                        "board": board or "",
+                    },
+                )
+        except Exception:
+            _log.debug(
+                "kanban deploy-lane: failed to reroute task %s from %s to %s",
+                task_id, current, correct, exc_info=True,
+            )
+    return correct
+
+
 def _enforce_follow_up_rule(
     conn: sqlite3.Connection,
     *,
@@ -2538,6 +2721,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     follow_up_kind: Optional[str] = None,
+    deploy_lane: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2781,8 +2965,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        deploy_lane
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2805,6 +2990,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        (deploy_lane.strip() if deploy_lane and deploy_lane.strip() else None),
                     ),
                 )
                 for pid in parents:
@@ -6037,6 +6223,12 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    deploy_lane_rerouted: list[tuple[str, str, str]] = field(default_factory=list)
+    """Deploy tasks whose assignee was rewritten this tick by the deploy-lane
+    guard because the wrong deployer was written on the task. Each entry is
+    ``(task_id, from_assignee, to_assignee)``. Surfaces the reroute to
+    telemetry / CLI / dashboard so operators can see when the lane guard
+    caught a misrouted deploy."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -7574,6 +7766,23 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+        # Phase 0 deploy-lane guard: if this is a deploy task (assignee
+        # role == deployer) and the assignee does not match the
+        # lane-resolved deployer for this board, rewrite it before the
+        # profile_exists check runs. This is the core fix for the
+        # "wrong-deployer" problem — a deploy task can never be run by a
+        # deployer that does not own its lane, regardless of what
+        # assignee was written on the row. The reroute is surfaced via
+        # result.deploy_lane_rerouted so operators can see it happen.
+        _before_lane = row_assignee
+        _lane_corrected = _enforce_deploy_lane(
+            conn, row["id"], board=board, dry_run=dry_run,
+        )
+        if _lane_corrected is not None and _lane_corrected != _before_lane:
+            row_assignee = _lane_corrected
+            result.deploy_lane_rerouted.append(
+                (row["id"], _before_lane, _lane_corrected)
+            )
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
