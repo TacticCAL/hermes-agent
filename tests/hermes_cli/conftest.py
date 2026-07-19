@@ -14,9 +14,23 @@ def all_assignees_spawnable(monkeypatch):
     patch, the dispatcher's profile-exists guard (PR #20105) routes
     those tasks into ``skipped_nonspawnable`` instead of spawning, which
     would break tests that assert spawn behavior.
+
+    The cost-quality phase added ``_check_profile_dispatch_eligibility``
+    (kanban_db.py), which does its OWN on-disk profile-dir check instead
+    of going through ``profiles.profile_exists``. Without patching it
+    here, synthetic assignees fail the eligibility gate with
+    "Profile 'bob' does not exist" and ~15 dispatch tests regress. We
+    stub it to "eligible" so the fixture's contract — "every assignee
+    is spawnable" — actually holds for both code paths.
     """
     from hermes_cli import profiles
     monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    from hermes_cli import kanban_db as _kb
+    _eligible = _kb.ProfileDispatchEligibility(exists=True, enabled=True)
+    monkeypatch.setattr(
+        _kb, "_check_profile_dispatch_eligibility",
+        lambda name, **kw: _eligible,
+    )
 
 
 @pytest.fixture(autouse=True)
