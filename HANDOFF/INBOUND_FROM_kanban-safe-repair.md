@@ -53,7 +53,7 @@ These are not part of the git commit and must be verified separately by TDC:
 ### Focused Kanban suite
 
 ```text
-130 passed in 19.52s
+144 passed in 18.57s
 ```
 
 Command:
@@ -67,6 +67,7 @@ python -m pytest \
   tests/tools/test_kanban_tools.py \
   tests/hermes_cli/test_kanban_worker_spawn_toolsets.py \
   tests/hermes_cli/test_kanban_worker_terminal_cwd.py \
+  tests/tools/test_windows_native_support.py::TestSubprocessCompatHelpers \
   -q --tb=short
 ```
 
@@ -108,6 +109,11 @@ Independent reviewer verdict: **PASS**.
   not evict a still-running handle merely to satisfy a fixed cap because that
   would recreate the lost-exit bug. The registry is naturally bounded by the
   dispatcher's concurrent-worker limit and removes each handle when it exits.
+- Two earlier architecture reviewers identified missing regression coverage.
+  Their requested cases are now pinned: clean-exit protocol violation,
+  profile-session budget lookup, blocked-parent gating, full
+  build→review→deploy order, rework gating, archived-parent consistency, and
+  mutually exclusive Windows process flags.
 
 ## Broad-suite disclosure
 

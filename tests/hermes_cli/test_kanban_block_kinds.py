@@ -190,6 +190,67 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
         assert kb.get_task(conn, child).status == "ready"
 
 
+def test_blocked_parent_does_not_promote_review_child(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        parent = _running_task(conn, title="build")
+        child = kb.create_task(
+            conn, title="review", assignee="reviewer", parents=[parent]
+        )
+        kb.block_task(conn, parent, reason="not complete", kind="needs_input")
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+
+
+def test_build_review_deploy_chain_promotes_in_order(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        build = _running_task(conn, title="build")
+        review = kb.create_task(
+            conn, title="review", assignee="reviewer", parents=[build]
+        )
+        deploy = kb.create_task(
+            conn, title="deploy", assignee="deployer", parents=[review]
+        )
+        assert kb.get_task(conn, review).status == "todo"
+        assert kb.get_task(conn, deploy).status == "todo"
+
+        kb.complete_task(conn, build, result="built")
+        assert kb.get_task(conn, review).status == "ready"
+        assert kb.get_task(conn, deploy).status == "todo"
+
+        assert kb.claim_task(conn, review, claimer="reviewer") is not None
+        kb.complete_task(conn, review, result="pass")
+        assert kb.get_task(conn, deploy).status == "ready"
+
+
+def test_rework_block_keeps_deploy_waiting_until_review_passes(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        review = _running_task(conn, title="review")
+        deploy = kb.create_task(
+            conn, title="deploy", assignee="deployer", parents=[review]
+        )
+        kb.block_task(conn, review, reason="needs rework", kind="needs_input")
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, deploy).status == "todo"
+
+        assert kb.unblock_task(conn, review)
+        assert kb.claim_task(conn, review, claimer="reviewer") is not None
+        kb.complete_task(conn, review, result="pass after rework")
+        assert kb.get_task(conn, deploy).status == "ready"
+
+
+def test_unblock_treats_archived_parent_as_satisfied(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="obsolete parent", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.block_task(conn, child, reason="human pause", kind="needs_input")
+        kb.archive_task(conn, parent)
+        assert kb.unblock_task(conn, child)
+        assert kb.get_task(conn, child).status == "ready"
+
+
 # ---------------------------------------------------------------------------
 # Completion resets loop memory
 # ---------------------------------------------------------------------------

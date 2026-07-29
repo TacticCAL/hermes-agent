@@ -572,11 +572,14 @@ class TestSubprocessCompatHelpers:
         from hermes_cli import _subprocess_compat as sc
         monkeypatch.setattr(sc, "IS_WINDOWS", True)
         flags = sc.windows_detach_flags()
-        # CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW |
-        # CREATE_BREAKAWAY_FROM_JOB
+        # CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS |
+        # CREATE_BREAKAWAY_FROM_JOB. CREATE_NO_WINDOW is intentionally absent:
+        # Win32 documents it as mutually exclusive with DETACHED_PROCESS.
         assert flags & 0x00000200, "missing CREATE_NEW_PROCESS_GROUP"
         assert flags & 0x00000008, "missing DETACHED_PROCESS"
-        assert flags & 0x08000000, "missing CREATE_NO_WINDOW"
+        assert not flags & 0x08000000, (
+            "DETACHED_PROCESS must not be combined with CREATE_NO_WINDOW"
+        )
         assert flags & 0x01000000, "missing CREATE_BREAKAWAY_FROM_JOB"
 
     def test_windows_detach_flags_includes_breakaway_from_job(self, monkeypatch):
@@ -619,10 +622,13 @@ class TestSubprocessCompatHelpers:
         fallback = sc.windows_detach_flags_without_breakaway()
         # Fallback equals full minus the breakaway bit, nothing else changed.
         assert fallback == full & ~0x01000000
-        # And the three "detach" bits we still need are present.
+        # The detach bits remain; CREATE_NO_WINDOW must stay absent because it
+        # is mutually exclusive with DETACHED_PROCESS.
         assert fallback & 0x00000200, "fallback missing CREATE_NEW_PROCESS_GROUP"
         assert fallback & 0x00000008, "fallback missing DETACHED_PROCESS"
-        assert fallback & 0x08000000, "fallback missing CREATE_NO_WINDOW"
+        assert not fallback & 0x08000000, (
+            "fallback must not combine DETACHED_PROCESS with CREATE_NO_WINDOW"
+        )
 
 
 # ---------------------------------------------------------------------------
