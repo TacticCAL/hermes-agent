@@ -651,6 +651,51 @@ def run_conversation(
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")
 
+        # ------------------------------------------------------------------
+        # BIG-JOB LANDING CHECKPOINT (enforced, not advisory)
+        # ------------------------------------------------------------------
+        # On 2026-07-28 three kanban workers ran to exactly 120/120 and were
+        # killed at the ceiling. Each had finished its build but spent its
+        # last steps POLLING for a review verdict, so no HANDOFF was written
+        # and the next run had to start over. The SOUL.md rule existed but was
+        # only advice the model could ignore while busy waiting.
+        #
+        # This injects a real instruction into the conversation at ~83% of
+        # budget, once, so the worker lands its work while it still can.
+        if (
+            os.environ.get("HERMES_KANBAN_TASK")
+            and not getattr(agent, "_landing_checkpoint_sent", False)
+            and agent.max_iterations
+            and api_call_count >= max(1, int(agent.max_iterations * 0.83))
+        ):
+            agent._landing_checkpoint_sent = True
+            _left = agent.max_iterations - api_call_count
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"SYSTEM CHECKPOINT — step {api_call_count} of "
+                    f"{agent.max_iterations}. You have about {_left} steps "
+                    f"left before you are stopped.\n\n"
+                    "LAND YOUR WORK NOW. Do not start anything new.\n\n"
+                    "1. Commit everything that works and push the branch.\n"
+                    "2. Post a comment on the card that STARTS with the word "
+                    "HANDOFF and covers: DONE SO FAR, BRANCH + COMMIT, "
+                    "NEXT STEP, DO NOT REDO, GOTCHAS.\n"
+                    "3. Then finish your turn.\n\n"
+                    "DO NOT wait or poll for a review verdict, a subagent "
+                    "result, or CI. If you dispatched a review, say so in the "
+                    "handoff and finish — the verdict will arrive on its own "
+                    "card. Waiting is what burns the rest of your budget and "
+                    "loses your work.\n\n"
+                    "Running out of steps is fine. Leaving no handoff is not."
+                ),
+            })
+            if not agent.quiet_mode:
+                agent._safe_print(
+                    f"\n📌 Landing checkpoint at {api_call_count}/"
+                    f"{agent.max_iterations} — worker told to commit + handoff"
+                )
+
         # Grace call: the budget is exhausted but we gave the model one
         # more chance.  Consume the grace flag so the loop exits after
         # this iteration regardless of outcome.

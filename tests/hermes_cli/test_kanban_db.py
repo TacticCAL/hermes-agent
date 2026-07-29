@@ -757,10 +757,10 @@ def test_detect_crashed_workers_systemic_failure_fast_block(
             )
 
 
-def test_detect_crashed_workers_isolated_failure_normal_retry(
+def test_detect_crashed_workers_unknown_exit_blocks_once(
     kanban_home, monkeypatch,
 ):
-    """Below the systemic threshold, tasks retain normal retry budget."""
+    """Unknown Windows exits stop once because retrying can duplicate work."""
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
@@ -783,8 +783,8 @@ def test_detect_crashed_workers_isolated_failure_normal_retry(
 
         for tid in task_ids:
             task = kb.get_task(conn, tid)
-            assert task.status == "ready", (
-                f"task {tid} should stay ready (isolated), got {task.status}"
+            assert task.status == "blocked", (
+                f"task {tid} should stop for investigation, got {task.status}"
             )
 
 

@@ -792,6 +792,14 @@ def test_block_goal_mode_allows_dependency_kind(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
 
     tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(
+            conn, title="unfinished prerequisite", assignee="reviewer"
+        )
+        kb.link_tasks(conn, parent_id=parent, child_id=tid)
+    finally:
+        conn.close()
     out = kt._handle_block({"reason": "waiting on another task", "kind": "dependency"})
     d = json.loads(out)
     assert d.get("ok") is True
@@ -1629,6 +1637,10 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
     # period (default 30s) would skip the liveness check. Zero it out
     # for this test — we WANT immediate reclamation here.
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    # This test is about stale run ownership, not unknown-exit handling.
+    monkeypatch.setattr(
+        _kb, "_classify_worker_exit", lambda _pid: ("nonzero_exit", 1)
+    )
 
     conn = kb.connect()
     try:

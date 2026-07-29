@@ -148,7 +148,6 @@ def windows_detach_flags() -> int:
     return (
         _CREATE_NEW_PROCESS_GROUP
         | _DETACHED_PROCESS
-        | _CREATE_NO_WINDOW
         | _CREATE_BREAKAWAY_FROM_JOB
     )
 
@@ -180,7 +179,11 @@ def windows_detach_flags_without_breakaway() -> int:
     """
     if not IS_WINDOWS:
         return 0
-    return _CREATE_NEW_PROCESS_GROUP | _DETACHED_PROCESS | _CREATE_NO_WINDOW
+    # NOTE: DETACHED_PROCESS and CREATE_NO_WINDOW are mutually exclusive in the
+    # Win32 CreateProcess contract. Combining them is undefined and in practice
+    # Windows honours the detach and IGNORES the hide, producing visible
+    # console windows. Detach alone already gives the child no console.
+    return _CREATE_NEW_PROCESS_GROUP | _DETACHED_PROCESS
 
 
 def windows_hide_flags() -> int:

@@ -138,11 +138,39 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
 def test_dependency_block_routes_to_todo(kanban_home: Path) -> None:
     """Dependency waits never enter the human 'blocked' bucket."""
     with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="unfinished parent", assignee="worker")
         tid = _running_task(conn)
+        kb.link_tasks(conn, parent_id=parent, child_id=tid)
         assert kb.block_task(conn, tid, reason="need X first", kind="dependency")
         t = kb.get_task(conn, tid)
         assert t.status == "todo"
         assert t.block_kind == "dependency"
+
+
+def test_dependency_block_rejects_task_without_unfinished_parent(
+    kanban_home: Path,
+) -> None:
+    """A fake dependency wait must not immediately return to the work queue."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with pytest.raises(ValueError, match="unfinished parent"):
+            kb.block_task(conn, tid, reason="wait for review", kind="dependency")
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_dependency_block_rejects_already_finished_parent(
+    kanban_home: Path,
+) -> None:
+    """An old completed review cannot justify waiting for a new review."""
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="old review", assignee="reviewer")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+        tid = _running_task(conn)
+        kb.link_tasks(conn, parent_id=parent, child_id=tid)
+        with pytest.raises(ValueError, match="unfinished parent"):
+            kb.block_task(conn, tid, reason="wait for current review", kind="dependency")
+        assert kb.get_task(conn, tid).status == "running"
 
 
 def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:

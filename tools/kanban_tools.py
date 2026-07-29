@@ -380,6 +380,50 @@ def _handle_show(args: dict, **kw) -> str:
             if task is None:
                 return tool_error(f"task {tid} not found")
             comments = kb.list_comments(conn, tid)
+            # ----------------------------------------------------------
+            # Context budget: a worker re-reads this card on every run.
+            # Unfiltered, a busy card returned 40,000+ characters (~11k
+            # tokens, roughly three turns of budget) and most of it was
+            # automated "I stopped you" notices about failures that were
+            # already fixed. Keep the signal, drop the noise.
+            # ----------------------------------------------------------
+            _NOISE_AUTHORS = {"token-cop", "token_cop", "factory-brakes"}
+            _KEEP_RECENT = 6
+
+            def _is_noise(c):
+                author = (getattr(c, "author", "") or "").lower()
+                if author in _NOISE_AUTHORS:
+                    return True
+                body = (getattr(c, "body", "") or "")
+                return "STOPPED ON PURPOSE" in body or "KILLED by TOKEN COP" in body
+
+            _signal = [c for c in comments if not _is_noise(c)]
+            _noise_n = len(comments) - len(_signal)
+
+            # BIG-JOB RESUME CONTRACT: the newest HANDOFF note is the most
+            # valuable thing on a large card -- it is how the next run
+            # continues instead of re-exploring from zero. Never let it fall
+            # out of the window with the older comments.
+            _handoff = None
+            for _c in reversed(_signal):
+                if (getattr(_c, "body", "") or "").lstrip().upper().startswith("HANDOFF"):
+                    _handoff = _c
+                    break
+
+            # Always keep the newest handoff/status notes; drop older ones.
+            _dropped_old = max(0, len(_signal) - _KEEP_RECENT)
+            comments = _signal[-_KEEP_RECENT:] if _dropped_old else _signal
+            if _handoff is not None and _handoff not in comments:
+                comments = [_handoff] + comments
+                _dropped_old = max(0, _dropped_old - 1)
+            _comment_note = None
+            if _noise_n or _dropped_old:
+                _comment_note = (
+                    f"{_noise_n} automated stop-notice(s) and {_dropped_old} older "
+                    f"comment(s) omitted to save context. Showing the newest "
+                    f"{len(comments)}. Use kanban_comment history on the board UI "
+                    f"if you need the full thread."
+                )
             events = kb.list_events(conn, tid)
             runs = kb.list_runs(conn, tid)
             parents = kb.parent_ids(conn, tid)
@@ -409,7 +453,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
 
-            return json.dumps({
+            payload = {
                 "task": _task_dict(task),
                 "parents": parents,
                 "children": children,
@@ -421,15 +465,20 @@ def _handle_show(args: dict, **kw) -> str:
                 "events": [
                     {"kind": e.kind, "payload": e.payload,
                      "created_at": e.created_at, "run_id": e.run_id}
-                    for e in events[-50:]   # cap; full log via CLI
+                    for e in events[-12:]   # cap; full log via CLI
                 ],
-                "runs": [_run_dict(r) for r in runs],
+                # Only the newest runs matter to a worker resuming work; the
+                # full run history is large and is available via the CLI.
+                "runs": [_run_dict(r) for r in runs[-3:]],
                 # Also surface the worker's own context block so the
                 # agent can include it directly if it wants. This is
                 # the same string build_worker_context returns to the
                 # dispatcher at spawn time.
                 "worker_context": kb.build_worker_context(conn, tid),
-            })
+            }
+            if _comment_note:
+                payload["comments_note"] = _comment_note
+            return json.dumps(payload)
         finally:
             conn.close()
     except ValueError as e:

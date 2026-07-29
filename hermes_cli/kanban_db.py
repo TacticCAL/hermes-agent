@@ -1187,7 +1187,19 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- dispatch time via DEPLOY_LANE_ROUTES. Set explicitly to override
     -- the board-derived lane (rare; used when a deploy task must run on
     -- a different board's deployer than its own).
-    deploy_lane          TEXT
+    deploy_lane          TEXT,
+    -- Effort estimate in hours, written at creation time. Primary purpose:
+    -- the board progress bar weights by real work instead of counting every
+    -- card as equal (a 2-hour deploy used to move the bar as much as a
+    -- 115-hour phase build).
+    est_hours            REAL,
+    -- Budget class DERIVED from est_hours: small / normal / big. Size is
+    -- never set independently of the estimate, so the two cannot disagree.
+    size                 TEXT,
+    -- How the size was decided: estimated_hours, hours_in_text,
+    -- keyword_backstop, explicit_size, or historical_default. Kept so a
+    -- mis-sized card can be diagnosed instead of guessed at.
+    size_source          TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2462,7 +2474,11 @@ _PROFILE_ROLE_MAP = {
     "td-slop": "fixer",
     "video": "builder",
     "tacticcal-website": "builder",
-    "scheduler": "deployer",  # Scheduler module should not create tasks
+    "scheduler": "builder",  # scheduler-module is a product/module builder (NOT a deployer)
+    "pos-module": "builder",
+    "distributor-module": "builder",
+    "gun-book": "builder",
+    "payroc": "builder",
     "default": "builder",  # Default assignee treated as builder
 }
 
@@ -2500,6 +2516,13 @@ DEPLOY_LANE_ROUTES: dict[str, str] = {
     "appraisal-firearm": "deployer-appraisal-firearm",
     "probate-firearm": "deployer-probate-firearm",
     "sitrep-ready": "deployer-sitrep-ready",
+    # These boards all use the default TacticCAL deployer (same repo)
+    "tacticcal": "deployer",
+    "4473-dros-module": "deployer",
+    "module-1": "deployer",
+    "module-2": "deployer",
+    "video-creation": "deployer",
+    "3d-prints-2a": "deployer",
 }
 
 
@@ -2694,6 +2717,87 @@ def _enforce_follow_up_rule(
             f"Comment on the existing task instead. "
             f"(Origin task {origin_task} already has {existing_children} child)"
         )
+
+
+def _budget_exhaustion_note(conn, task_id: str):
+    """Return a plain-English reason when a worker died at its step ceiling.
+
+    A worker terminated at the iteration ceiling exits without an exit code,
+    so the reaper cannot classify it and previously logged the useless
+    "pid N not alive". Cross-check the worker's own session: if it made at
+    least as many API calls as its budget allowed, it did not crash -- it ran
+    out of room. Returning None means "genuinely unexplained".
+    """
+    try:
+        row = conn.execute(
+            "SELECT session_id, goal_max_turns FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row or not row["session_id"]:
+            return None
+        session_id = row["session_id"]
+        budget = int(row["goal_max_turns"] or 0)
+        if budget <= 0:
+            return None
+
+        home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        for state_db in sorted((home / "profiles").glob("*/state.db")):
+            try:
+                sc = sqlite3.connect(str(state_db))
+                sc.row_factory = sqlite3.Row
+                s = sc.execute(
+                    "SELECT api_call_count FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                sc.close()
+            except Exception:
+                continue
+            if not s:
+                continue
+            calls = int(s["api_call_count"] or 0)
+            if calls >= budget:
+                return (
+                    f"budget exhausted at {calls}/{budget} steps — the worker "
+                    f"used its full allowance and was stopped at the ceiling "
+                    f"(this is NOT a crash; check for committed work and a "
+                    f"HANDOFF note before re-running)"
+                )
+            return None
+    except Exception:
+        return None
+    return None
+
+
+
+def _classify_task_size(title: str, body: Optional[str] = None) -> dict:
+    """Size a task and return its consistent budget.
+
+    Delegates to the shared sizing module so the DISTRIBUTE button, agent
+    plan setup, and worker follow-ups all size identically. Falls back to a
+    safe built-in default if that module is unavailable, so task creation can
+    never break because of sizing.
+    """
+    try:
+        import importlib.util as _ilu
+
+        _p = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        _mod_path = _p / "scripts" / "task_sizing.py"
+        if _mod_path.exists():
+            _spec = _ilu.spec_from_file_location("_hermes_task_sizing", str(_mod_path))
+            _m = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_m)
+            return _m.classify(title or "", body or "")
+    except Exception:
+        pass
+    # Conservative fallback: normal budget, consistent token headroom.
+    return {
+        "size": "normal",
+        "est_hours": 4.0,
+        "size_source": "fallback_default",
+        "max_api_calls": 60,
+        "max_cost_usd": 4.00,
+        "max_input_tokens": 350_000,
+    }
 
 
 def create_task(
@@ -2958,41 +3062,109 @@ def create_task(
                         except Exception:
                             branch_name = None
 
-                conn.execute(
-                    """
-                    INSERT INTO tasks (
-                        id, title, body, assignee, status, priority,
-                        created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
-                        max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id,
-                        deploy_lane
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        task_id,
-                        title.strip(),
-                        body,
-                        assignee,
-                        task_status,
-                        priority,
-                        created_by,
-                        now,
-                        workspace_kind,
-                        workspace_path,
-                        branch_name,
-                        project_id,
-                        tenant,
-                        idempotency_key,
-                        int(max_runtime_seconds) if max_runtime_seconds is not None else None,
-                        json.dumps(skills_list) if skills_list is not None else None,
-                        int(max_retries) if max_retries is not None else None,
-                        1 if goal_mode else 0,
-                        int(goal_max_turns) if goal_max_turns is not None else None,
-                        session_id,
-                        (deploy_lane.strip() if deploy_lane and deploy_lane.strip() else None),
-                    ),
+                # ------------------------------------------------------
+                # Auto-sizing (single choke point for ALL task creation)
+                # ------------------------------------------------------
+                # Every door onto the board -- the DISTRIBUTE button, an
+                # agent setting up a plan, and worker follow-up cards --
+                # lands here, so sizing cannot drift between them.
+                #
+                # Size is DERIVED from an hour estimate so the two can never
+                # disagree. The budget attached to the size is internally
+                # consistent: a task told it may make N API calls is given
+                # enough token headroom to actually make them.
+                _sizing = _classify_task_size(title, body)
+                _size = _sizing["size"]
+                _est_hours = _sizing["est_hours"]
+                _size_source = _sizing["size_source"]
+                # Goal-loop mode is opt-in. Ordinary cards stay single-shot.
+                # Preserve the goals engine's own default when an explicit goal
+                # card does not supply a turn budget; only persist a caller's
+                # stated override here.
+                _turns = (
+                    int(goal_max_turns)
+                    if goal_mode and goal_max_turns is not None
+                    else None
                 )
+
+                _task_cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+                _has_sizing = {"est_hours", "size", "size_source"} <= _task_cols
+
+                if _has_sizing:
+                    conn.execute(
+                        """
+                        INSERT INTO tasks (
+                            id, title, body, assignee, status, priority,
+                            created_by, created_at, workspace_kind, workspace_path,
+                            branch_name, project_id, tenant, idempotency_key,
+                            max_runtime_seconds,
+                            skills, max_retries, goal_mode, goal_max_turns, session_id,
+                            deploy_lane, est_hours, size, size_source
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            task_id,
+                            title.strip(),
+                            body,
+                            assignee,
+                            task_status,
+                            priority,
+                            created_by,
+                            now,
+                            workspace_kind,
+                            workspace_path,
+                            branch_name,
+                            project_id,
+                            tenant,
+                            idempotency_key,
+                            int(max_runtime_seconds) if max_runtime_seconds is not None else None,
+                            json.dumps(skills_list) if skills_list is not None else None,
+                            int(max_retries) if max_retries is not None else None,
+                            1 if goal_mode else 0,
+                            _turns,
+                            session_id,
+                            (deploy_lane.strip() if deploy_lane and deploy_lane.strip() else None),
+                            _est_hours,
+                            _size,
+                            _size_source,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO tasks (
+                            id, title, body, assignee, status, priority,
+                            created_by, created_at, workspace_kind, workspace_path,
+                            branch_name, project_id, tenant, idempotency_key,
+                            max_runtime_seconds,
+                            skills, max_retries, goal_mode, goal_max_turns, session_id,
+                            deploy_lane
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            task_id,
+                            title.strip(),
+                            body,
+                            assignee,
+                            task_status,
+                            priority,
+                            created_by,
+                            now,
+                            workspace_kind,
+                            workspace_path,
+                            branch_name,
+                            project_id,
+                            tenant,
+                            idempotency_key,
+                            int(max_runtime_seconds) if max_runtime_seconds is not None else None,
+                            json.dumps(skills_list) if skills_list is not None else None,
+                            int(max_retries) if max_retries is not None else None,
+                            1 if goal_mode else 0,
+                            _turns,
+                            session_id,
+                            (deploy_lane.strip() if deploy_lane and deploy_lane.strip() else None),
+                        ),
+                    )
                 for pid in parents:
                     conn.execute(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
@@ -3702,22 +3874,11 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            # A parent that is done/archived satisfies the dependency.
-            # A parent that is *blocked for review* (worker called
-            # kanban_block(reason="review-required: ...")) also satisfies
-            # the dependency — the review task should be promoted to ready
-            # so the verifier can pick it up immediately, rather than
-            # waiting in todo forever because the parent never reaches 'done'.
+            # Only auto-promote a normal dependency after parents are done.
+            # A blocked parent with no kind is still a human/sticky block and
+            # must not be treated as review-complete automatically.
             def _parent_satisfied(p):
-                if p["status"] in ("done", "archived"):
-                    return True
-                if p["status"] == "blocked" and p["block_kind"] is None:
-                    # Sticky block without a known kind — treat as
-                    # review-required (the common case when a builder
-                    # blocks itself for review).  This lets the review
-                    # child promote so the verifier can run it.
-                    return True
-                return False
+                return p["status"] in ("done", "archived")
             if all(_parent_satisfied(p) for p in parents):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
@@ -4985,6 +5146,21 @@ def block_task(
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
         if kind == "dependency":
+            unfinished_parent = conn.execute(
+                """
+                SELECT 1
+                  FROM task_links l
+                  JOIN tasks p ON p.id = l.parent_id
+                 WHERE l.child_id = ?
+                   AND p.status NOT IN ('done', 'archived')
+                 LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if unfinished_parent is None:
+                raise ValueError(
+                    "dependency wait requires at least one unfinished parent task"
+                )
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -6051,6 +6227,8 @@ def classify_failure(error_text: str) -> str:
     text = str(error_text).lower()
 
     # Non-retryable: auth/credential/config errors that cannot heal on retry
+    # ALSO: bad workspace setup (unknown workspace_kind: repo) — Mike locked
+    # 2026-07-27: same setup error must hard-stop at 1, never burn 41 respawns.
     non_retryable_patterns = [
         "401", "unauthorized", "invalid api key", "invalid_api_key",
         "api key not set", "api_key not set", "missing credential",
@@ -6061,6 +6239,8 @@ def classify_failure(error_text: str) -> str:
         "does not exist", "profile not found",
         "executable not found", "hermes executable",
         "no module named", "importerror",
+        "unknown workspace_kind", "workspace_kind:",
+        "non-absolute workspace_path",
     ]
     for pattern in non_retryable_patterns:
         if pattern in text:
@@ -6242,6 +6422,42 @@ class DispatchResult:
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+# Windows has no waitpid-based child reaper. Retain Popen objects until their
+# real return code is observed instead of reducing every exit to "pid not alive".
+_worker_processes: "dict[int, Any]" = {}
+_recent_worker_returncodes: "dict[int, tuple[int, float]]" = {}
+
+
+def _register_worker_process(proc: Any) -> None:
+    """Retain a spawned process handle until its return code is observed."""
+    pid = int(getattr(proc, "pid", 0) or 0)
+    if pid > 0:
+        _worker_processes[pid] = proc
+
+
+def _poll_worker_processes() -> "list[int]":
+    """Record completed retained children and return their PIDs."""
+    finished: list[int] = []
+    now = time.time()
+    for pid, proc in list(_worker_processes.items()):
+        try:
+            code = proc.poll()
+        except Exception:
+            continue
+        if code is None:
+            continue
+        _recent_worker_returncodes[int(pid)] = (int(code), now)
+        _worker_processes.pop(pid, None)
+        finished.append(int(pid))
+    cutoff = now - _RECENT_WORKER_EXIT_TTL_SECONDS
+    for pid, (_code, observed_at) in list(_recent_worker_returncodes.items()):
+        if observed_at < cutoff:
+            _recent_worker_returncodes.pop(pid, None)
+    if len(_recent_worker_returncodes) > _RECENT_WORKER_EXITS_MAX:
+        ordered = sorted(_recent_worker_returncodes.items(), key=lambda item: item[1][1])
+        for pid, _ in ordered[: len(ordered) - _RECENT_WORKER_EXITS_MAX]:
+            _recent_worker_returncodes.pop(pid, None)
+    return finished
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
@@ -6291,6 +6507,17 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
     for ``unknown``.
     """
+    returncode_entry = _recent_worker_returncodes.get(int(pid))
+    if returncode_entry is not None:
+        code, _ = returncode_entry
+        if code == 0:
+            return ("clean_exit", 0)
+        if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+            return ("rate_limited", code)
+        if code < 0:
+            return ("signaled", abs(code))
+        return ("nonzero_exit", code)
+
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
@@ -6306,7 +6533,15 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
     except Exception:
-        pass
+        # Windows lacks POSIX wait-status helpers. Historical/tests still use
+        # the conventional normal-exit representation (return code << 8).
+        if int(raw) & 0x7F == 0:
+            code = int(raw) >> 8
+            if code == 0:
+                return ("clean_exit", 0)
+            if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+                return ("rate_limited", code)
+            return ("nonzero_exit", code)
     return ("unknown", None)
 
 
@@ -6316,7 +6551,7 @@ def reap_worker_zombies() -> "list[int]":
     Returns the list of reaped PIDs. Safe to call when there are no
     children (returns []). No-op on Windows.
     """
-    reaped: "list[int]" = []
+    reaped: "list[int]" = _poll_worker_processes()
     if os.name != "nt":
         try:
             while True:
@@ -6822,9 +7057,30 @@ def _error_fingerprint(error_text: str) -> str:
 
     Strips host-specific details (PIDs, timestamps) so that errors
     with the same root cause produce the same fingerprint.
+    Also strips any prior ``[fp:...]`` wrapper so re-fingerprinting a
+    stored last_failure_error still matches the raw error.
     """
-    fp = re.sub(r'\bpid \d+\b', 'pid N', error_text[:80])
-    fp = re.sub(r'\b\d{10,}\b', '<TS>', fp)
+    if not error_text:
+        return "unknown"
+    text = str(error_text)
+    # Unwrap previously stored fingerprints: "[fp:xxx] original..."
+    m = re.match(r"^\[fp:([^\]]+)\]\s*(.*)$", text, re.I | re.S)
+    if m:
+        # Prefer the original tail when present; else the tagged fingerprint.
+        text = (m.group(2) or m.group(1) or "").strip() or m.group(1)
+    # Semantic buckets for common factory failures (stable, short)
+    low = text.lower()
+    if "unknown workspace_kind" in low or re.search(r"workspace_kind\s*:", low):
+        return "workspace_kind_invalid"
+    if "not alive" in low and "pid" in low:
+        return "worker_pid_not_alive"
+    if "iteration budget exhausted" in low:
+        return "iteration_budget_exhausted"
+    if "non-absolute workspace_path" in low:
+        return "workspace_path_not_absolute"
+    fp = re.sub(r"\bpid\s+\d+\b", "pid N", text[:120], flags=re.I)
+    fp = re.sub(r"\b\d{6,}\b", "N", fp)
+    fp = re.sub(r"\s+", " ", fp)
     return fp.lower().strip()
 
 
@@ -6933,7 +7189,22 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 elif kind == "signaled":
                     error_text = f"pid {pid} killed by signal {code}"
                 else:
-                    error_text = f"pid {pid} not alive"
+                    # A worker terminated at its iteration ceiling dies without
+                    # writing an exit code, so it lands here and used to be
+                    # reported as a mystery crash. That cost a full hour of
+                    # wrong diagnosis on 2026-07-28: three workers had actually
+                    # run their budget to exactly 120/120 with committed,
+                    # green-gated work. Look up the real reason before
+                    # falling back to "not alive".
+                    exhausted = _budget_exhaustion_note(conn, row["id"])
+                    if exhausted:
+                        error_text = exhausted
+                    else:
+                        protocol_violation = True
+                        error_text = (
+                            f"worker exit result unavailable for pid {pid}; "
+                            "stopped once for investigation instead of restarting"
+                        )
                 event_kind = "crashed"
                 event_payload = {"pid": pid, "claimer": row["claim_lock"]}
                 if code is not None and kind != "unknown":
@@ -7066,16 +7337,35 @@ def _record_task_failure(
 
     Resolution order for the effective threshold:
       1. per-task ``max_retries`` if set (nothing else overrides)
-      2. caller-supplied ``failure_limit`` (gateway passes the config
-         value from ``kanban.failure_limit``; tests pass fixed values)
-      3. ``DEFAULT_FAILURE_LIMIT``
+      2. ``effective_failure_limit(error)`` classification
+         (setup/auth → 1, rate_limit → defer/None)
+      3. same failure fingerprint as last time → trip at 2
+         (Mike locked 2026-07-27: identical error twice = hard stop)
+      4. caller-supplied ``failure_limit`` (gateway ``kanban.failure_limit``)
+      5. ``DEFAULT_FAILURE_LIMIT``
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
+    # Classify up front so setup bugs (unknown workspace_kind) hard-stop at 1
+    # instead of burning 41 respawns. Rate-limit returns None = don't count.
+    classified_limit = effective_failure_limit(error, base_limit=int(failure_limit))
+    if classified_limit is None:
+        # rate_limit path: stamp error, do not increment failure counter
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                ((error or "")[:500], task_id),
+            )
+        return False
+
+    error_fp = _error_fingerprint(error or "")
+    # Encode fingerprint into stored error so Token Cop / next attempts see it
+    stored_error = f"[fp:{error_fp}] {(error or '')}"[:500]
+
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, last_failure_error "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
@@ -7092,8 +7382,13 @@ def _record_task_failure(
             effective_limit = int(task_override)
             limit_source = "task"
         else:
-            effective_limit = int(failure_limit)
-            limit_source = "dispatcher"
+            # Classification (setup/auth → 1) wins over generic dispatcher limit
+            effective_limit = int(classified_limit)
+            limit_source = "classifier" if classified_limit != int(failure_limit) else "dispatcher"
+
+        # Mike's single rule is three consecutive failures. A repeated
+        # fingerprint is recorded for diagnosis but does not lower the limit.
+        # Never silently convert configured failure_limit=3 into 2.
 
         if failures >= effective_limit:
             # Trip the breaker.
@@ -7102,9 +7397,10 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = COALESCE(block_kind, 'needs_input') "
                     "WHERE id = ? AND status IN ('running', 'ready')",
-                    (failures, error[:500], task_id),
+                    (failures, stored_error, task_id),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready``
@@ -7112,9 +7408,10 @@ def _record_task_failure(
                 # counter fields.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = COALESCE(block_kind, 'needs_input') "
                     "WHERE id = ? AND status IN ('ready', 'running')",
-                    (failures, error[:500], task_id),
+                    (failures, stored_error, task_id),
                 )
             run_id = None
             if end_run:
@@ -7122,26 +7419,45 @@ def _record_task_failure(
                 run_id = _end_run(
                     conn, task_id,
                     outcome="gave_up", status="gave_up",
-                    error=error[:500],
+                    error=stored_error,
                     metadata={
                         "failures": failures,
                         "trigger_outcome": outcome,
                         "effective_limit": effective_limit,
                         "limit_source": limit_source,
+                        "fingerprint": error_fp,
                     },
                 )
             payload = {
                 "failures": failures,
                 "effective_limit": effective_limit,
                 "limit_source": limit_source,
-                "error": error[:500],
+                "error": stored_error,
                 "trigger_outcome": outcome,
+                "fingerprint": error_fp,
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
+            # Plain-English stop note for Mike (no jargon first line).
+            try:
+                plain = _plain_english_failure_note(
+                    error=error or "",
+                    fingerprint=error_fp,
+                    failures=failures,
+                    limit=effective_limit,
+                    limit_source=limit_source,
+                    outcome=outcome,
+                )
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, 'factory-brakes', ?, ?)",
+                    (task_id, plain, int(time.time())),
+                )
+            except Exception:
+                pass
             blocked = True
         else:
             # Below threshold.
@@ -7152,7 +7468,7 @@ def _record_task_failure(
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (failures, error[:500], task_id),
+                    (failures, stored_error, task_id),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready`` via
@@ -7160,23 +7476,78 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET consecutive_failures = ?, "
                     "last_failure_error = ? WHERE id = ?",
-                    (failures, error[:500], task_id),
+                    (failures, stored_error, task_id),
                 )
             if end_run:
                 # Spawn path: close the open run with outcome.
                 run_id = _end_run(
                     conn, task_id,
                     outcome=outcome, status=outcome,
-                    error=error[:500],
-                    metadata={"failures": failures},
+                    error=stored_error,
+                    metadata={"failures": failures, "fingerprint": error_fp},
                 )
                 _append_event(
                     conn, task_id, outcome,
-                    {"error": error[:500], "failures": failures},
+                    {
+                        "error": stored_error,
+                        "failures": failures,
+                        "fingerprint": error_fp,
+                    },
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
     return blocked
+
+
+def _plain_english_failure_note(
+    *,
+    error: str,
+    fingerprint: str,
+    failures: int,
+    limit: int,
+    limit_source: str,
+    outcome: str,
+) -> str:
+    """Mike-readable stop note when the factory circuit breaker trips."""
+    err_l = (error or "").lower()
+    if "unknown workspace_kind" in err_l or "workspace_kind" in err_l:
+        what = "Couldn't open the project folder (bad folder setup)."
+        next_step = (
+            "Builder should fix the folder setup once (allowed auto-fix), "
+            "then try ONE clean restart — not the same blind retry."
+        )
+    elif "not alive" in err_l and "pid" in err_l:
+        what = "The worker process died while the job was running."
+        next_step = (
+            "Check if money safety killed it, or if the machine ran out of "
+            "room. Do not keep restarting until the cause is named."
+        )
+    elif "iteration budget" in err_l:
+        what = "Used every allowed work step without finishing."
+        next_step = "Split the job into smaller pieces, or raise the step budget with a clear plan."
+    elif limit_source == "same_error_fingerprint":
+        what = "Hit the SAME problem twice in a row."
+        next_step = "Stop. Diagnose. Fix the cause. Blind retries burn money."
+    elif limit_source == "classifier":
+        what = "This is a setup/config problem that will not heal by retrying."
+        next_step = "Fix setup (folder, keys, profile) once — or ask Mike if it needs him."
+    else:
+        what = "Failed too many times in a row."
+        next_step = "Read the last error, change approach, or park with what Mike must decide."
+
+    return (
+        "🛑 STOPPED ON PURPOSE (factory brakes)\n\n"
+        f"What happened: {what}\n"
+        f"Strikes: {failures}/{limit} (reason code: {limit_source})\n"
+        f"Outcome: {outcome}\n"
+        f"Problem label: {fingerprint}\n\n"
+        f"What next: {next_step}\n\n"
+        "Builder rules: after fail #2 ask why; after fail #3 stop and reassess. "
+        "Never blind-retry the same error. "
+        "Auto-fix OK for folder/lock/wrong-board. "
+        "Always ask Mike before live deploy, money-up, delete work, or secrets.\n"
+        f"[fp:{fingerprint}]"
+    )
 
 
 # Backward-compat alias. Old name is referenced from tests and possibly
@@ -8104,7 +8475,14 @@ def _module_hermes_argv() -> list[str]:
     # ``hermes_cli.main`` is the console-script target declared in
     # pyproject.toml, NOT a top-level ``hermes`` package — there is no
     # ``hermes`` package to import.
-    return [sys.executable, "-m", "hermes_cli.main"]
+    # On Windows, use pythonw.exe (GUI subsystem) to avoid Windows Terminal
+    # intercepting the spawn and creating visible console windows.
+    exe = sys.executable
+    if _IS_WINDOWS and exe.lower().endswith("python.exe"):
+        pythonw = exe.rsplit(".", 1)[0] + "w.exe"
+        if os.path.exists(pythonw):
+            exe = pythonw
+    return [exe, "-m", "hermes_cli.main"]
 
 
 def _absolute_hermes_path(path: str) -> str:
@@ -8168,8 +8546,15 @@ def _hermes_path_argv(path: str) -> list[str]:
     worker launches because the argument vector includes task-derived
     values. Prefer the interpreter-bound module form whenever the resolved
     executable is only a shell shim.
+
+    On Windows, also prefer ``pythonw -m hermes_cli.main`` over console
+    ``hermes.exe``. Console-subsystem binaries get intercepted by Windows
+    Terminal and open visible tabs even with CREATE_NO_WINDOW.
     """
-    if _IS_WINDOWS and _is_windows_batch_shim(path):
+    if _IS_WINDOWS and (
+        _is_windows_batch_shim(path)
+        or os.path.basename(path).lower() in {"hermes.exe", "hermes"}
+    ):
         return _module_hermes_argv()
     return [_absolute_hermes_path(path)]
 
@@ -8425,6 +8810,24 @@ def _default_spawn(
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
 
+    # Windows console suppression.
+    #
+    # CREATE_NO_WINDOW and DETACHED_PROCESS are MUTUALLY EXCLUSIVE per the
+    # Win32 CreateProcess contract. Passing both is undefined behaviour and in
+    # practice Windows ignores the hide request, which is what produced the
+    # storm of visible pythonw.exe console windows. Use CREATE_NO_WINDOW
+    # ALONE, reinforced by STARTUPINFO/SW_HIDE, and never re-add
+    # DETACHED_PROCESS here.
+    _popen_extra = {}
+    if _IS_WINDOWS:
+        _si = subprocess.STARTUPINFO()
+        _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        _si.wShowWindow = 0  # SW_HIDE
+        _popen_extra = {
+            "creationflags": subprocess.CREATE_NO_WINDOW,
+            "startupinfo": _si,
+        }
+
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
@@ -8435,8 +8838,8 @@ def _default_spawn(
             stdout=log_f,
             stderr=subprocess.STDOUT,
             env=env,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            start_new_session=not _IS_WINDOWS,
+            **_popen_extra,
         )
     except FileNotFoundError:
         log_f.close()
@@ -8449,6 +8852,10 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    # Retain the handle so Windows can report the real return code. POSIX also
+    # benefits from this; the waitpid registry remains a fallback for older
+    # callers and externally spawned children.
+    _register_worker_process(proc)
     return proc.pid
 
 
