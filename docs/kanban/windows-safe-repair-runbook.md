@@ -1,10 +1,10 @@
-# INBOUND FROM kanban-safe-repair
+# Hermes Kanban Windows Safe-Repair Runbook
 
-**Status:** CODE COMPLETE / TESTED / NOT DEPLOYED
+**Status:** CODE COMPLETE / TESTED / NOT LOADED BY RUNNING GATEWAY
 **Branch:** `feature/deploy-lanes`
 **Builder:** Hermes Desktop main session
 **Date:** 2026-07-28
-**Mike decision:** Option A — safest repair. This is permission to repair Kanban only. It is **not** production deployment approval.
+**Owner:** Hermes Agent/Kanban operator. This is not a TacticCAL Dashboard handoff and is not for TDC.
 
 ## Plain-English result
 
@@ -37,7 +37,7 @@ This repair stops the board from paying to restart work when Windows cannot prov
 
 ## Out-of-repository live support files
 
-These are not part of the git commit and must be verified separately by TDC:
+These are not part of the git commit and must be verified separately by the Hermes/Kanban operator:
 
 - `C:\Users\mikey\AppData\Local\hermes\scripts\token_cop.py`
   - Uses provider-specific rates.
@@ -105,7 +105,7 @@ Independent reviewer verdict: **PASS**.
 - Two documentation/cleanup suggestions were applied in a follow-up commit:
   the retry-policy description now matches Mike's three-failure rule, and an
   unused database field read was removed.
-- The reviewer suggested optionally capping retained process handles. TDC should
+- The reviewer suggested optionally capping retained process handles. The operator should
   not evict a still-running handle merely to satisfy a fixed cap because that
   would recreate the lost-exit bug. The registry is naturally bounded by the
   dispatcher's concurrent-worker limit and removes each handle when it exits.
@@ -126,7 +126,7 @@ The remaining failures are pre-existing/test-harness assumptions rather than fai
 - Unix `waitpid` reaper tests run on Windows without forcing Unix mode.
 - Two worktree-dispatch fixtures patch the wrong profile-existence reference.
 
-TDC must either update those platform assumptions or prove the same baseline failures on the branch base before merging. Do not claim the entire repository suite is green.
+The Hermes maintainer/operator must either update those platform assumptions or prove the same baseline failures on the branch base before merging. Do not claim the entire repository suite is green.
 
 ## Live-card reconciliation performed
 
@@ -135,7 +135,7 @@ No builds were rerun and nothing was deployed.
 1. NFA Phase 2 build `t_687ad632` was closed from verified git evidence:
    - Real code commits: `e69a880c`, `51c2c21c`
    - Handoff commit: `49255626`
-   - Separate TDC review remains `t_0dbb7b5a`
+   - Application-review record remains `t_0dbb7b5a`
 2. Purchasing-safety build `t_23109b78` was closed from verified git and verifier evidence:
    - Real code commits: `6131af97`, `894ca436`, `b7c87a7f`
    - Verifier PASS: `t_7d9b59ad`
@@ -145,20 +145,20 @@ No builds were rerun and nothing was deployed.
 
 After reconciliation, stopped cards fell from six to four; the two false build failures disappeared.
 
-## TDC deployment instructions
+## Hermes operator activation instructions
 
-1. Review this branch and the independent reviewer result.
-2. Run the focused 130-test command above.
+1. Review this Hermes Agent branch and the independent reviewer result.
+2. Run the focused 144-test command above.
 3. Run `python scripts/kanban_safe_repair_canary.py` twice.
 4. Verify the out-of-repo Token Cop script and safety scripts listed above.
 5. Resolve or baseline the 18 broad-suite Windows harness failures before merge.
-6. Merge the reviewed branch according to the existing Hermes/TDC branch policy.
+6. Merge the reviewed branch according to the Hermes Agent repository policy.
 7. Restart the Hermes gateway only after the merge. A restart is required for the running gateway to load the code.
 8. After restart, reapply/verify Money Dial and Token Cop, per Mike’s locked restart procedure.
 9. Run one temporary or harmless canary before allowing live cards to dispatch.
 10. Monitor only events newer than the restart timestamp for at least 24 hours.
 
-## Post-deploy checks
+## Post-activation checks
 
 - A Windows child exiting 0 is classified as a clean exit.
 - A clean exit with no final card transition stops once as a protocol problem.
@@ -182,7 +182,7 @@ If the repair causes a regression:
 
 ## Hard NO-GO conditions
 
-Do not deploy if:
+Do not activate the repair if:
 
 - Focused tests fail.
 - The temporary canary fails.
@@ -190,6 +190,6 @@ Do not deploy if:
 - Unknown exits return to `ready` instead of stopping once.
 - Fake dependency waits are accepted.
 - Token Cop counts events from another board or before the latest reset.
-- TDC cannot explain the 18 broad-suite Windows harness failures.
+- The Hermes maintainer/operator cannot explain the 18 broad-suite Windows harness failures.
 
-**This handoff does not authorize production deployment, Neon changes, or restarting finished builds.**
+**This runbook does not authorize TacticCAL production deployment, Neon changes, or restarting finished builds.**
