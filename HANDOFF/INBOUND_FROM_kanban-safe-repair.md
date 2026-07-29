@@ -95,6 +95,20 @@ The canary uses a temporary Kanban database and makes zero model calls.
 - `git diff --check`: PASS.
 - Static secret/injection scan of added lines: no findings.
 
+### Independent review
+
+Independent reviewer verdict: **PASS**.
+
+- Security concerns: none.
+- Logic errors: none.
+- Two documentation/cleanup suggestions were applied in a follow-up commit:
+  the retry-policy description now matches Mike's three-failure rule, and an
+  unused database field read was removed.
+- The reviewer suggested optionally capping retained process handles. TDC should
+  not evict a still-running handle merely to satisfy a fixed cap because that
+  would recreate the lost-exit bug. The registry is naturally bounded by the
+  dispatcher's concurrent-worker limit and removes each handle when it exits.
+
 ## Broad-suite disclosure
 
 `tests/hermes_cli/test_kanban_db.py` is not fully green on this Windows checkout: **205 passed, 18 failed**.
