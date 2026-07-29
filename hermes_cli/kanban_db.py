@@ -7339,10 +7339,11 @@ def _record_task_failure(
       1. per-task ``max_retries`` if set (nothing else overrides)
       2. ``effective_failure_limit(error)`` classification
          (setup/auth → 1, rate_limit → defer/None)
-      3. same failure fingerprint as last time → trip at 2
-         (Mike locked 2026-07-27: identical error twice = hard stop)
-      4. caller-supplied ``failure_limit`` (gateway ``kanban.failure_limit``)
-      5. ``DEFAULT_FAILURE_LIMIT``
+      3. caller-supplied ``failure_limit`` (gateway ``kanban.failure_limit``)
+      4. ``DEFAULT_FAILURE_LIMIT``
+
+    Failure fingerprints are stored for diagnosis only. They never silently
+    lower Mike's configured three-failure rule.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -7365,7 +7366,7 @@ def _record_task_failure(
 
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, last_failure_error "
+            "SELECT consecutive_failures, status, max_retries "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
