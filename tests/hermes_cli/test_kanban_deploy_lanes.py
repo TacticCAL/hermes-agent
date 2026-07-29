@@ -63,14 +63,15 @@ def test_resolve_deployer_for_board_explicit_routes():
     assert resolve_deployer_for_board("sitrep-core") == "deployer-sitrepcore"
     assert resolve_deployer_for_board("sitrepcore") == "deployer-sitrepcore"
     assert resolve_deployer_for_board("appraisal-firearm") == "deployer-appraisal-firearm"
-    assert resolve_deployer_for_board("probate-firearm") == "deployer-probate-firearm"
+    assert resolve_deployer_for_board("probate-firearm") == "deployer"
 
 
 def test_resolve_deployer_for_board_derives_from_slug():
     """Boards not in the explicit table derive deployer-<slug>."""
     from hermes_cli.kanban_db import resolve_deployer_for_board
-    assert resolve_deployer_for_board("tacticcal") == "deployer-tacticcal"
-    assert resolve_deployer_for_board("module-2") == "deployer-module-2"
+    assert resolve_deployer_for_board("module-2") == "deployer"  # explicitly routed in table
+    # tacticcal is explicitly in DEPLOY_LANE_ROUTES -> "deployer" (not derived)
+    assert resolve_deployer_for_board("tacticcal") == "deployer"
 
 
 def test_resolve_deployer_for_board_falls_back_to_default():

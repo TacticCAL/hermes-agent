@@ -2514,7 +2514,7 @@ DEPLOY_LANE_ROUTES: dict[str, str] = {
     "sitrep-core": "deployer-sitrepcore",
     "sitrepcore": "deployer-sitrepcore",
     "appraisal-firearm": "deployer-appraisal-firearm",
-    "probate-firearm": "deployer-probate-firearm",
+    "probate-firearm": "deployer",  # Mike changed this board to TacticCAL Dashboard code
     "sitrep-ready": "deployer-sitrep-ready",
     # These boards all use the default TacticCAL deployer (same repo)
     "tacticcal": "deployer",
