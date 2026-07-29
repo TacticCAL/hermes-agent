@@ -99,7 +99,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived", "parked"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -3857,7 +3857,8 @@ def recompute_ready(
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'blocked') "
+            "AND status != 'parked'"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -5389,15 +5390,18 @@ def promote_task(
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
-    Defensively closes any stale ``current_run_id`` pointer before flipping
-    status. In the common path (``block_task`` closed the run already) this
-    is a no-op. If a future or external write left the pointer dangling,
-    the leaked run is closed as ``reclaimed`` inside the same txn so the
-    runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
-    state) holds for the rest of this function's lifetime.
+    ``parked`` tasks are NOT affected by this function — only ``unpark_task``
+    can release them. This prevents cron jobs and automated unblock loops
+    from respawning a card Mike explicitly parked.
     """
     now = int(time.time())
     with write_txn(conn):
+        # Refuse to unblock a parked task.
+        cur_status = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if cur_status and cur_status["status"] == "parked":
+            return False
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -6189,6 +6193,85 @@ def schedule_task(
                 summary=reason,
             )
         _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        return True
+
+
+def park_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Park a task so it stays put until Mike explicitly says go.
+
+    ``parked`` tasks are invisible to the dispatcher, recompute_ready, and
+    Token Cop. They do not respawn, do not get unblocked by cron, and do not
+    accumulate failure comments. Only ``unpark_task`` (or a manual status
+    change by Mike) can release them back to ``ready``.
+    """
+    with write_txn(conn):
+        params: list[Any] = [task_id]
+        sql = """
+            UPDATE tasks
+               SET status       = 'parked',
+                   claim_lock   = NULL,
+                   claim_expires= NULL,
+                   worker_pid   = NULL,
+                   consecutive_failures = 0,
+                   last_failure_error = NULL,
+                   block_kind    = 'parked'
+             WHERE id = ?
+               AND status IN ('todo', 'ready', 'running', 'blocked',
+                               'scheduled', 'triage')
+        """
+        if expected_run_id is not None:
+            sql += " AND current_run_id = ?"
+            params.append(int(expected_run_id))
+        cur = conn.execute(sql, params)
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="parked", status="parked",
+            summary=reason,
+        )
+        if run_id is None and reason:
+            run_id = _synthesize_ended_run(
+                conn, task_id,
+                outcome="parked",
+                summary=reason,
+            )
+        _append_event(conn, task_id, "parked", {"reason": reason}, run_id=run_id)
+        return True
+
+
+def unpark_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Release a parked task back to ready (or todo if parents incomplete).
+
+    Only Mike should call this — either directly or through the board UI.
+    """
+    with write_txn(conn):
+        undone_parents = conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        new_status = "todo" if undone_parents else "ready"
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "block_kind = NULL "
+            "WHERE id = ? AND status = 'parked'",
+            (new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "unparked",
+            {"status": new_status} if new_status != "ready" else None,
+        )
         return True
 
 
